@@ -67,7 +67,7 @@ for i in range(0, 5000, 1234):
     print(' '.join(data_words[i]))
 
 # 测试集和训练集
-with open('data/sogou_news_test.txt', 'w') as f:
+with open('data/sogou_news_test.txt', 'w', encoding='utf-8') as f:
     for i in range(len(data_words)):
         if i % 5 == 0:
             s = '__label__' + label_selected[i] + ' '
@@ -75,7 +75,7 @@ with open('data/sogou_news_test.txt', 'w') as f:
             f.write(s)
             f.write('\n')
 
-with open('data/sogou_news_train.txt', 'w') as f:
+with open('data/sogou_news_train.txt', 'w', encoding='utf-8') as f:
     for i in range(len(data_words)):
         if i % 5 != 0:
             s = '__label__' + label_selected[i] + ' '
@@ -92,3 +92,4 @@ classifier = fasttext.supervised(input_file='data/sogou_news_train.txt',
                                  lr=lr,
                                  epoch=5)
 result_tr = classifier.test('data/sogou_news_test.txt')
+print(result_tr)
