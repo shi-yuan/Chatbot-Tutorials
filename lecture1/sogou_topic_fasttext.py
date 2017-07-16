@@ -92,4 +92,4 @@ classifier = fasttext.supervised(input_file='data/sogou_news_train.txt',
                                  lr=lr,
                                  epoch=5)
 result_tr = classifier.test('data/sogou_news_test.txt')
-print(result_tr)
+print(result_tr.precision)
