@@ -1,10 +1,12 @@
 import collections
+import math
 import re
 from collections import Counter
 
 import gensim
 import jieba
 import numpy as np
+import tensorflow as tf
 from tqdm import tqdm
 
 # 调用 jieba分词module后，添加单词本（人名等）:
@@ -161,13 +163,11 @@ def generate_batch_sg(data, batch_size, num_skips, slide_window):
         buffer.append(data[data_index])
         data_index = (data_index + 1) % len(data)
 
-    # # 下面的 for 循环：
+    # 下面的 for 循环：
     # 在产生一个有batch_size个样本的minibatch的时候，
     # 我们选择 batch_size//num_skips 个 “当前单词” （或者叫“目标单词”）
-    # 并且从“当前单词”左右的2*slide_window 个词语组成的context里面选择
-    # num_skips个单词
-    # “当前单词”（我们叫做x）和num_skips个单词中的每一个（我们叫做y_i）
-    # 组成一个监督学习样本：
+    # 并且从“当前单词”左右的2*slide_window 个词语组成的context里面选择num_skips个单词
+    # “当前单词”（我们叫做x）和num_skips个单词中的每一个（我们叫做y_i）组成一个监督学习样本：
     # 给定单词x, 在它的context里面应该大概率地出现单词y_i
     for i in range(batch_size // num_skips):
         # 在每个长度为2*slide_window + 1 的滑动窗里面，
@@ -189,3 +189,106 @@ def generate_batch_sg(data, batch_size, num_skips, slide_window):
             data_index = (data_index + 1) % len(data)
 
     return batch, labels
+
+
+# 测试代码：
+batch_size = 8
+for num_skips, slide_window in [(2, 1), (4, 2)]:
+    batch, labels = generate_batch_sg(data=data,
+                                      batch_size=batch_size,
+                                      num_skips=num_skips,
+                                      slide_window=slide_window)
+    print('\nwith num_skips = %d and slide_window = %d:' % (num_skips, slide_window))
+    for i in range(batch_size):
+        print('%s --> %s' % (reverse_dictionary[batch[i]],
+                             reverse_dictionary[labels[i][0]]))
+
+batch_size = 128
+num_sampled = 64  # 近似计算cross entropy loss的时候的negative examples参数
+embedding_size = 128  # Dimension of the embedding vector
+
+# skip-gram的两个重要的hyperparameters:
+# 1. 语境范围：考虑和周围多少个词语的共存关系
+slide_window = 1
+# 2.　”使用频率“：（当前单词，临近单词）的组合使用多少次
+num_skips = 1  # How many times to reuse an input to generate a label
+
+# 产生测试数据
+valid_size = 8
+valid_examples = list(np.random.permutation(1000)[:valid_size])
+names = ['史塔克', '提利昂', '琼恩', '长城', '南方', '死亡', '家族', '支持', '愤怒']
+for name in names:
+    valid_examples.append(dictionary[name])
+    valid_size += 1
+
+graph_sg = tf.Graph()
+
+with graph_sg.as_default():  # , tf.device('/cpu:0'):
+
+    # Input data.
+    train_dataset = tf.placeholder(tf.int32, shape=[batch_size])
+    train_labels = tf.placeholder(tf.int32, shape=[batch_size, 1])
+    valid_dataset = tf.constant(valid_examples, dtype=tf.int32)
+
+    # Variables.
+    embeddings = tf.Variable(
+        tf.random_uniform([vocabulary_size, embedding_size], -1.0, 1.0))
+    softmax_weights = tf.Variable(
+        tf.truncated_normal([vocabulary_size, embedding_size],
+                            stddev=1.0 / math.sqrt(embedding_size)))
+    softmax_biases = tf.Variable(tf.zeros([vocabulary_size]))
+
+    # Model.
+    # Look up embeddings for inputs.
+    embed = tf.nn.embedding_lookup(embeddings, train_dataset)
+    # Compute the softmax loss, using a sample of the negative labels each time.
+    loss = tf.reduce_mean(
+        tf.nn.sampled_softmax_loss(weights=softmax_weights, biases=softmax_biases, inputs=embed,
+                                   labels=train_labels, num_sampled=num_sampled, num_classes=vocabulary_size))
+
+    # Optimizer.
+    # Note: The optimizer will optimize the softmax_weights AND the embeddings.
+    # This is because the embeddings are defined as a variable quantity and the
+    # optimizer's `minimize` method will by default modify all variable quantities
+    # that contribute to the tensor it is passed.
+    # See docs on `tf.train.Optimizer.minimize()` for more details.
+    # optimizer = tf.train.AdamOptimizer(learning_rate = 0.001).minimize(loss)
+    optimizer = tf.train.AdagradOptimizer(learning_rate=3.0).minimize(loss)
+
+    # Compute the similarity between minibatch examples and all embeddings.
+    # We use the cosine distance:
+    norm = tf.sqrt(tf.reduce_sum(tf.square(embeddings), 1, keep_dims=True))
+    normalized_embeddings = embeddings / norm
+    valid_embeddings = tf.nn.embedding_lookup(normalized_embeddings, valid_dataset)
+    similarity = tf.matmul(valid_embeddings, tf.transpose(normalized_embeddings))
+
+num_steps = 100001
+
+with tf.Session(graph=graph_sg) as session:
+    tf.global_variables_initializer().run()
+    print('Initialized')
+    average_loss = 0
+    for step in range(num_steps):
+        batch_data, batch_labels = generate_batch_sg(data, batch_size, num_skips, slide_window)
+        feed_dict = {train_dataset: batch_data, train_labels: batch_labels}
+        _, l = session.run([optimizer, loss], feed_dict=feed_dict)
+        average_loss += l
+        if step % 2000 == 0:
+            if step > 0:
+                average_loss = average_loss / 2000
+            print('Average loss at step %d: %f' % (step, average_loss))
+            average_loss = 0
+
+        # note that this is expensive (~20% slowdown if computed every 500 steps)
+        if step % 10000 == 0:
+            sim = similarity.eval()
+            for i in range(valid_size):
+                valid_word = reverse_dictionary[valid_examples[i]]
+                top_k = 8  # number of nearest neighbors
+                nearest = (-sim[i, :]).argsort()[1:top_k + 1]
+                log = 'Nearest to %s:' % valid_word
+                for k in range(top_k):
+                    close_word = reverse_dictionary[nearest[k]]
+                    log = '%s %s,' % (log, close_word)
+                print(log)
+    final_embeddings_sg = normalized_embeddings.eval()
