@@ -292,3 +292,198 @@ with tf.Session(graph=graph_sg) as session:
                     log = '%s %s,' % (log, close_word)
                 print(log)
     final_embeddings_sg = normalized_embeddings.eval()
+
+####################
+# cbow 模型
+####################
+data_index = 0
+
+
+def generate_batch_cbow(data, batch_size, slide_window, num_skips):
+    """
+    Arguments:
+        data: list_of_integer格式的文本
+        batch_size: 一个minibatch的样本大小
+        slide_window: 滑动窗口的大小，定义语境（context）的范围
+        num_skips: 语境(context)包含的单词数量
+
+    Returns:
+        batch: 一个minibatch的语境
+        labels: 一个minibatch的标记
+    """
+
+    global data_index
+
+    # 和skip-gram不同，
+    # cbow里面，输入的语境context 和 输出的label包含不同数量的单词
+    # 因为，一个样本包含 (1) num_skips个context单词 和 (2) 一个label单词
+    # 我们表示为 num_context 和 batch_size：
+    num_context = num_skips * batch_size
+    batch = np.ndarray(shape=(num_context), dtype=np.int32)
+    labels = np.ndarray(shape=(batch_size, 1), dtype=np.int32)
+
+    # # 使用一个buffer记录和更新滑动窗，[ slide_window target slide_window ]
+    span = 2 * slide_window + 1
+    buffer = collections.deque(maxlen=span)
+    for _ in range(span):
+        buffer.append(data[data_index])
+        data_index = (data_index + 1) % len(data)
+
+    # # 从每一个新的滑动窗提取一个训练样本:
+    # （num_skips个单词组成的语境context, 一个目标单词作为标记）
+    for i in range(batch_size):
+        rand_x = np.random.permutation(span)
+        if 2 * slide_window == num_skips:
+            for j in range(slide_window):
+                batch[i * num_skips + j] = buffer[j]
+            for j in range(slide_window, 2 * slide_window):
+                batch[i * num_skips + j] = buffer[j + 1]
+        else:
+            j, k = 0, 0
+            for j in range(num_skips):
+                while rand_x[k] == slide_window:
+                    k += 1
+                batch[i * num_skips + j] = buffer[rand_x[k]]
+                k += 1
+        labels[i, 0] = buffer[slide_window]
+
+        # 将滑动窗向右滑动随机步
+        rand_step = np.random.randint(1, 5)
+        for _ in range(rand_step):
+            buffer.append(data[data_index])
+            data_index = (data_index + 1) % len(data)
+
+    return batch, labels
+
+
+# 测试：
+slide_window = 1
+num_skips = 2
+batch_size = 8
+
+batch, labels = generate_batch_cbow(data=data,
+                                    batch_size=batch_size,
+                                    slide_window=slide_window,
+                                    num_skips=num_skips)
+
+print('\nwith num_skips = %d and slide_window = %d:' % (num_skips, slide_window))
+
+print('batch context size = %s' % repr(np.shape(batch)))
+for x in range(0, batch_size * num_skips, num_skips):
+    print(' '.join([reverse_dictionary[bi] for bi in batch[x:x + num_skips]])
+          + ' ==> '
+          + reverse_dictionary[labels[x // num_skips][0]])
+
+batch_size = 128
+embedding_size = 128  # 词向量维度
+num_sampled = 64  # Number of negative examples to sample.
+
+## cbow的hyperparameters：
+# 语境范围，考虑和周围多少个词语的共存关系
+slide_window = 1
+num_skips = 2
+
+# 产生测试数据
+valid_size = 8
+valid_examples = list(np.random.permutation(1000)[:valid_size])
+names = ['史塔克', '提利昂', '琼恩', '长城', '南方', '死亡', '家族', '支持', '愤怒']
+for name in names:
+    valid_examples.append(dictionary[name])
+    valid_size += 1
+
+graph_cbow = tf.Graph()
+with graph_cbow.as_default():
+    ## 第一层：数据
+    # 训练数据分配内存空间
+    train_dataset = tf.placeholder(tf.int32, shape=[num_skips * batch_size])
+    train_labels = tf.placeholder(tf.int32, shape=[batch_size, 1])
+    # 　固定的测试数据，以tf.constant这种variable形式
+    valid_dataset = tf.constant(valid_examples, dtype=tf.int32)
+
+    ## 第一层与第二层之间：词向量矩阵
+    # 一个tf.Variable对象，将整数ID映射为词向量特征
+    embeddings = tf.Variable(tf.random_uniform([vocabulary_size, embedding_size], -1.0, 1.0))
+
+    ## 第二层：通过查询操作将context（整数ID的list）转化为词向量
+    # 通过对context里面的所有词的词向量们简单加和得到context的词向量表示
+    # shape = [ (batch_size * num_skip) x embedding_size ]
+    embed = tf.nn.embedding_lookup(embeddings, train_dataset)
+    # shape = [ batch_size x num_skip x embedding_size ]
+    embed = tf.reshape(embed, [batch_size, num_skips, -1])
+    # shape = [ batch_size x embedding_size]
+    final_embed = tf.reduce_sum(input_tensor=embed, axis=1, keep_dims=False)
+
+    ## 第三层：预测
+    # 给定context的词向量表示，预测target，和真实的target比较，计算loss
+    softmax_weights = tf.Variable(
+        tf.truncated_normal([vocabulary_size, embedding_size], stddev=1.0 / math.sqrt(embedding_size)))
+    softmax_biases = tf.Variable(tf.zeros([vocabulary_size]))
+
+    loss = tf.reduce_mean(
+        tf.nn.sampled_softmax_loss(weights=softmax_weights,
+                                   biases=softmax_biases,
+                                   inputs=final_embed,
+                                   labels=train_labels,
+                                   num_sampled=num_sampled,
+                                   num_classes=vocabulary_size))
+
+    # 优化参数
+    # optimizer = tf.train.AdamOptimizer(learning_rate = 0.01).minimize(loss)
+    optimizer = tf.train.AdagradOptimizer(learning_rate=1.0).minimize(loss)
+
+    ## 测试模型：
+    # 　
+    # Compute the similarity between minibatch validation examples and
+    #   all embeddings, using the cosine distance:
+    #
+    # 第一步： 对每个单词的词向量归一化
+    norm = tf.sqrt(tf.reduce_sum(tf.square(embeddings), 1, keep_dims=True))
+    # 小心： must use argument 'keep_dims=True' to normalize correctly
+    normalized_embeddings = embeddings // norm
+    # 第二步： 对 valid_dataset 里面的每一个单词查询归一化的词向量
+    valid_embeddings = tf.nn.embedding_lookup(normalized_embeddings, valid_dataset)
+    # 第三步： 通过内积计算 valid_dataset 里面的每一个单词和所有单词的cosine similarity
+    similarity = tf.matmul(valid_embeddings, tf.transpose(normalized_embeddings))
+
+num_steps = 100001
+
+with tf.Session(graph=graph_cbow) as session:
+    session.run(tf.global_variables_initializer())
+    print("Initialized")
+    average_loss = 0
+    for step in range(num_steps):
+        # generate minibatch of samples, feed into feed_dict
+        batch_data, batch_labels = generate_batch_cbow(data=data,
+                                                       batch_size=batch_size,
+                                                       slide_window=slide_window,
+                                                       num_skips=num_skips)
+
+        feed_dict = {train_dataset: batch_data, train_labels: batch_labels}
+
+        # run session to calculate loss and optimize parameters
+        _, l = session.run([optimizer, loss], feed_dict=feed_dict)
+
+        # 1. simple evaluation:
+        #   calculate and display average loss every 2000 minibatch
+        average_loss += l
+        if step % 2000 == 0:
+            if step > 0:
+                average_loss = average_loss / 2000
+            # The average loss is an estimate of the loss over the last 2000 batches.
+            print("Average loss at step %d is %s" % (step, average_loss))
+            average_loss = 0
+
+        # 2. expensive evaluation:
+        #   calculate cosine similarities every 10,000 minibatch
+        if step % 10000 == 0:
+            sim = similarity.eval()
+            for i in range(valid_size):
+                valid_word = reverse_dictionary[valid_examples[i]]
+                top_k = 8  # number of nearest neighbors
+                nearest = (-sim[i, :]).argsort()[1:top_k + 1]
+                log = "Nearest to %s:" % valid_word
+                for k in range(top_k):
+                    close_word = reverse_dictionary[nearest[k]]
+                    log = "%s %s," % (log, close_word)
+                print(log)
+    final_embeddings_cbow = normalized_embeddings.eval()
